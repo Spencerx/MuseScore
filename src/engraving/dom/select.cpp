@@ -538,15 +538,15 @@ void Selection::appendChord(Chord* chord)
             }
         }
 
-        if (note->laissezVib()) {
+        if (note->laissezVib() && !note->laissezVib()->segmentsEmpty()) {
             appendFiltered(note->laissezVib()->frontSegment());
         }
 
-        if (note->incomingPartialTie()) {
+        if (note->incomingPartialTie() && !note->incomingPartialTie()->segmentsEmpty()) {
             appendFiltered(note->incomingPartialTie()->frontSegment());
         }
 
-        if (note->outgoingPartialTie()) {
+        if (note->outgoingPartialTie() && !note->outgoingPartialTie()->segmentsEmpty()) {
             appendFiltered(note->outgoingPartialTie()->frontSegment());
         }
     }
@@ -1075,6 +1075,7 @@ muse::ByteArray Selection::symbolListMimeData() const
             e = toSpannerSegment(e)->spanner();
             [[fallthrough]];
         case ElementType::SLUR:
+        case ElementType::HAMMER_ON_PULL_OFF:
         case ElementType::HAIRPIN:
         case ElementType::OTTAVA:
         case ElementType::TRILL:
