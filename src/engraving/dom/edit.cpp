@@ -44,6 +44,7 @@
 #include "glissando.h"
 #include "guitarbend.h"
 #include "hairpin.h"
+#include "hammeronpulloff.h"
 #include "harmony.h"
 #include "harppedaldiagram.h"
 #include "hook.h"
@@ -115,6 +116,21 @@ static ChordRest* chordOrRest(EngravingItem* el)
     }
 
     return nullptr;
+}
+
+static String harmonyName(const EngravingItem* harmonyOrFretDiagram)
+{
+    String result;
+    if (harmonyOrFretDiagram->isHarmony()) {
+        result = toHarmony(harmonyOrFretDiagram)->harmonyName();
+    } else {
+        const FretDiagram* fretDiagram = toFretDiagram(harmonyOrFretDiagram);
+        if (fretDiagram->harmony()) {
+            result = fretDiagram->harmony()->harmonyName();
+        }
+    }
+
+    return result;
 }
 
 //---------------------------------------------------------
@@ -667,8 +683,32 @@ Slur* Score::addSlur(ChordRest* firstChordRest, ChordRest* secondChordRest, cons
         options.disableOverRepeats = true;
         secondChordRest = nextChordRest(firstChordRest, options);
 
-        if (!secondChordRest) {
-            secondChordRest = firstChordRest;
+        if (!secondChordRest || !secondChordRest->isChord()) {
+            if (slurTemplate && slurTemplate->isHammerOnPullOff() && firstChordRest->isChord()) {
+                Note* endNote = GuitarBend::createEndNote(toChord(firstChordRest)->upNote());
+                if (endNote) {
+                    secondChordRest = endNote->chord();
+                }
+            }
+            if (!secondChordRest) {
+                secondChordRest = firstChordRest;
+            }
+        } else if (secondChordRest->isChord()) {
+            bool firstChordRestIsTiedToSecond = firstChordRest->isChord() && toChord(firstChordRest)->allNotesTiedToNext()
+                                                && toChord(firstChordRest)->upNote()->tieFor()->endNote()->parent() == secondChordRest;
+
+            // Follow chain of tied notes and slur until the last
+            while (toChord(secondChordRest)->allNotesTiedToNext()) {
+                secondChordRest = toChord(secondChordRest)->upNote()->tieFor()->endNote()->chord();
+            }
+
+            // If the first chord rest is also tied to this chain, slur to the next non-tied note
+            if (firstChordRestIsTiedToSecond) {
+                ChordRest* nextCandidate = nextChordRest(secondChordRest, options);
+                if (nextCandidate) {
+                    secondChordRest = nextCandidate;
+                }
+            }
         }
     }
 
@@ -687,7 +727,7 @@ Slur* Score::addSlur(ChordRest* firstChordRest, ChordRest* secondChordRest, cons
     slur->setEndElement(secondChordRest);
 
     firstChordRest->score()->undoAddElement(slur);
-    SlurSegment* ss = new SlurSegment(firstChordRest->score()->dummy()->system());
+    SlurTieSegment* ss = slur->newSlurTieSegment(firstChordRest->score()->dummy()->system());
     ss->setSpannerSegmentType(SpannerSegmentType::SINGLE);
     if (firstChordRest == secondChordRest && !(slur->isOutgoing() || slur->isIncoming())) {
         ss->setSlurOffset(Grip::END, PointF(3.0 * firstChordRest->style().spatium(), 0.0));
@@ -2507,7 +2547,8 @@ void Score::cmdFlip()
                    || e->isPedalSegment()
                    || e->isLyrics()
                    || e->isBreath()
-                   || e->isFermata()) {
+                   || e->isFermata()
+                   || e->isHammerOnPullOffText()) {
             e->undoChangeProperty(Pid::AUTOPLACE, true);
             // TODO: undoChangeProperty() should probably do this directly
             // see https://musescore.org/en/node/281432
@@ -2603,6 +2644,7 @@ void Score::deleteItem(EngravingItem* el)
         case ElementType::KEYSIG:
         case ElementType::MEASURE_NUMBER:
         case ElementType::SYSTEM_LOCK_INDICATOR:
+        case ElementType::HAMMER_ON_PULL_OFF_TEXT:
             break;
         // All other types cannot be removed if generated
         default:
@@ -3046,6 +3088,7 @@ void Score::deleteItem(EngravingItem* el)
     case ElementType::HARMONIC_MARK_SEGMENT:
     case ElementType::PICK_SCRAPE_SEGMENT:
     case ElementType::GUITAR_BEND_SEGMENT:
+    case ElementType::HAMMER_ON_PULL_OFF_SEGMENT:
     {
         el = toSpannerSegment(el)->spanner();
         if (el->isTie()) {
@@ -3060,6 +3103,10 @@ void Score::deleteItem(EngravingItem* el)
         undoRemoveElement(el);
     }
     break;
+
+    case ElementType::HAMMER_ON_PULL_OFF_TEXT:
+        undoRemoveHopoText(toHammerOnPullOffText(el));
+        break;
 
     case ElementType::STEM_SLASH:                   // cannot delete this elements
     case ElementType::HOOK:
@@ -3561,9 +3608,9 @@ void Score::deleteAnnotationsFromRange(Segment* s1, Segment* s2, track_idx_t tra
 void Score::deleteRangeAtTrack(std::vector<ChordRest*>& crsToSelect, const track_idx_t track, Segment* startSeg,
                                const Fraction& endTick, Tuplet* currentTuplet)
 {
-    while (startSeg && !startSeg->cr(track)) {
+    while (startSeg && !(startSeg->isChordRestType() && startSeg->cr(track))) {
         // Range should always start at a ChordRest segment - find the next one for this track...
-        startSeg = startSeg->next1();
+        startSeg = startSeg->next1(SegmentType::ChordRest);
     }
 
     if (!startSeg) {
@@ -3818,6 +3865,21 @@ void Score::cmdDeleteSelection()
             if (e->isNote() && toNote(e)->isTrillCueNote()) {
                 selectCRAtTickAndTrack(tick, track);
                 continue;
+            }
+
+            // We can't delete elements inside fret box
+            if (e->isFretDiagram() || e->isHarmony()) {
+                if (e->isFretDiagram() && e->explicitParent()->isFBox()) {
+                    elSelectedAfterDeletion = toFBox(e->explicitParent());
+                    continue;
+                } else {
+                    EngravingObject* parent = toHarmony(e)->explicitParent();
+                    FretDiagram* fretDiagram = parent->isFretDiagram() ? toFretDiagram(parent) : nullptr;
+                    if (fretDiagram && fretDiagram->explicitParent()->isFBox()) {
+                        elSelectedAfterDeletion = toFBox(fretDiagram->explicitParent());
+                        continue;
+                    }
+                }
             }
 
             if (e->isFretDiagram()) {
@@ -5138,7 +5200,7 @@ void Score::cloneVoice(track_idx_t strack, track_idx_t dtrack, Segment* sf, cons
 
     if (spanner) {
         // Find and add corresponding slurs and hairpins
-        static const std::set<ElementType> SPANNERS_TO_COPY { ElementType::SLUR, ElementType::HAIRPIN };
+        static const std::set<ElementType> SPANNERS_TO_COPY { ElementType::SLUR, ElementType::HAMMER_ON_PULL_OFF, ElementType::HAIRPIN };
         auto spanners = score->spannerMap().findOverlapping(start.ticks(), lTick.ticks());
         for (auto i = spanners.begin(); i < spanners.end(); i++) {
             Spanner* sp      = i->value;
@@ -5730,9 +5792,14 @@ void Score::undoChangeChordRestLen(ChordRest* cr, const TDuration& d)
 //   undoTransposeHarmony
 //---------------------------------------------------------
 
-void Score::undoTransposeHarmony(Harmony* h, int rootTpc, int baseTpc)
+void Score::undoTransposeHarmony(Harmony* h, Interval interval, bool doubleSharpFlat)
 {
-    undo(new TransposeHarmony(h, rootTpc, baseTpc));
+    undo(new TransposeHarmony(h, interval, doubleSharpFlat));
+}
+
+void Score::undoTransposeHarmonyDiatonic(Harmony* h, int interval, bool doubleSharpFlat, bool transposeKeys)
+{
+    undo(new TransposeHarmonyDiatonic(h, interval, doubleSharpFlat, transposeKeys));
 }
 
 //---------------------------------------------------------
@@ -5996,6 +6063,7 @@ static void undoChangeNoteVisibility(Note* note, bool visible)
         ElementType::NOTE,
         ElementType::LYRICS,
         ElementType::SLUR,
+        ElementType::HAMMER_ON_PULL_OFF,
         ElementType::CHORD, // grace notes
         ElementType::LEDGER_LINE, // temporary objects, impossible to change visibility
     };
@@ -6284,6 +6352,7 @@ void Score::undoAddElement(EngravingItem* element, bool addToLinkedStaves, bool 
             && et != ElementType::CHORDLINE
             && et != ElementType::LYRICS
             && et != ElementType::SLUR
+            && et != ElementType::HAMMER_ON_PULL_OFF
             && et != ElementType::TIE
             && et != ElementType::NOTE
             && et != ElementType::INSTRUMENT_CHANGE
@@ -6355,6 +6424,7 @@ void Score::undoAddElement(EngravingItem* element, bool addToLinkedStaves, bool 
             ElementType::OTTAVA,
             ElementType::TRILL,
             ElementType::SLUR,
+            ElementType::HAMMER_ON_PULL_OFF,
             ElementType::VIBRATO,
             ElementType::TEXTLINE,
             ElementType::PEDAL,
@@ -6551,11 +6621,12 @@ void Score::undoAddElement(EngravingItem* element, bool addToLinkedStaves, bool 
                         if (!score->style().styleB(Sid::concertPitch)) {
                             interval.flip();
                         }
-                        int rootTpc = transposeTpc(h->rootTpc(), interval, true);
-                        int baseTpc = transposeTpc(h->bassTpc(), interval, true);
-                        score->undoTransposeHarmony(h, rootTpc, baseTpc);
+                        score->undoTransposeHarmony(h, interval);
                     }
                 }
+            }
+            if (ne->isHarmony() || ne->isFretDiagram()) {
+                score->undoAddChordToFretBox(ne);
             }
         } else if (element->isSlur()
                    || element->isHairpin()
@@ -6927,6 +6998,105 @@ void Score::updateSystemLocksOnCreateMMRests(Measure* first, Measure* last)
     undoAddSystemLock(new SystemLock(startMB, endMB));
 }
 
+FBox* Score::findFretBox() const
+{
+    for (MeasureBase* measure = first(); measure; measure = measure->next()) {
+        if (measure->isFBox()) {
+            return toFBox(measure);
+        }
+    }
+
+    return nullptr;
+}
+
+void Score::undoRenameChordInFretBox(const Harmony* harmony, const String& oldName)
+{
+    Score* score = harmony->score();
+    IF_ASSERT_FAILED(score) {
+        return;
+    }
+
+    FBox* fretBox = score->findFretBox();
+    if (!fretBox) {
+        return;
+    }
+
+    score->undo(new RenameChordFBox(fretBox, harmony, oldName));
+    fretBox->triggerLayout();
+
+    for (EngravingObject* linkedObject : fretBox->linkList()) {
+        if (!linkedObject || !linkedObject->isFBox()) {
+            continue;
+        }
+
+        FBox* box = toFBox(linkedObject);
+
+        box->score()->undo(new RenameChordFBox(box, harmony, oldName));
+        box->triggerLayout();
+    }
+}
+
+void Score::undoAddChordToFretBox(const EngravingItem* harmonyOrFretDiagram)
+{
+    IF_ASSERT_FAILED(harmonyOrFretDiagram && (harmonyOrFretDiagram->isHarmony() || harmonyOrFretDiagram->isFretDiagram())) {
+        return;
+    }
+
+    Score* score = harmonyOrFretDiagram->score();
+    if (!score) {
+        return;
+    }
+
+    FBox* fretBox = score->findFretBox();
+    if (!fretBox) {
+        return;
+    }
+
+    String chordName = harmonyName(harmonyOrFretDiagram);
+    if (chordName.empty()) {
+        return;
+    }
+
+    score->undo(new AddChordFBox(fretBox, chordName, harmonyOrFretDiagram->tick()));
+    fretBox->triggerLayout();
+
+    for (EngravingObject* linkedObject : fretBox->linkList()) {
+        if (!linkedObject || !linkedObject->isFBox()) {
+            continue;
+        }
+
+        FBox* box = toFBox(linkedObject);
+
+        box->score()->undo(new AddChordFBox(box, chordName, harmonyOrFretDiagram->tick()));
+        box->triggerLayout();
+    }
+}
+
+void Score::undoRemoveChordFromFretBox(const EngravingItem* harmonyOrFretDiagram)
+{
+    IF_ASSERT_FAILED(harmonyOrFretDiagram && (harmonyOrFretDiagram->isHarmony() || harmonyOrFretDiagram->isFretDiagram())) {
+        return;
+    }
+
+    Score* score = harmonyOrFretDiagram->score();
+    if (!score) {
+        return;
+    }
+
+    FBox* fretBox = score->findFretBox();
+    if (!fretBox) {
+        return;
+    }
+
+    String chordName = harmonyName(harmonyOrFretDiagram);
+    if (chordName.empty()) {
+        return;
+    }
+
+    score->undo(new RemoveChordFBox(fretBox, chordName, harmonyOrFretDiagram->tick()));
+    fretBox->triggerLayout();
+}
+
 //---------------------------------------------------------
 //   undoAddCR
 //---------------------------------------------------------
@@ -7028,6 +7198,10 @@ void Score::undoRemoveElement(EngravingItem* element, bool removeLinked)
     for (EngravingObject* ee : element->linkList()) {
         EngravingItem* e = static_cast<EngravingItem*>(ee);
         if (e == element || removeLinked) {
+            if (e->isHarmony() || e->isFretDiagram()) {
+                undoRemoveChordFromFretBox(e);
+            }
+
             doUndoRemoveElement(e);
 
             if (e->explicitParent() && (e->explicitParent()->isSegment())) {
@@ -7062,6 +7236,72 @@ void Score::undoRemoveElement(EngravingItem* element, bool removeLinked)
             } else {
                 doUndoRemoveElement(s);
             }
+        }
+    }
+}
+
+void Score::undoRemoveHopoText(HammerOnPullOffText* hopoText)
+{
+    Chord* startChord = hopoText->startChord();
+    Chord* endChord = hopoText->endChord();
+    IF_ASSERT_FAILED(startChord && endChord) {
+        return;
+    }
+
+    HammerOnPullOffSegment* hopoSegment = toHammerOnPullOffSegment(hopoText->parentItem());
+    HammerOnPullOff* hopo = hopoSegment ? hopoSegment->hammerOnPullOff() : nullptr;
+    IF_ASSERT_FAILED(hopo) {
+        return;
+    }
+
+    Chord* hopoStartChord = toChord(hopo->startElement());
+    Chord* hopoEndChord = toChord(hopo->endElement());
+    IF_ASSERT_FAILED(hopoStartChord && hopoEndChord) {
+        return;
+    }
+
+    if (startChord == hopoStartChord && endChord == hopoEndChord) {
+        undoRemoveElement(hopo);
+        return;
+    }
+
+    Fraction hopoStartTick = hopo->tick();
+    Fraction hopoEndTick = hopo->tick2();
+    Fraction hopoTextStartTick = startChord->tick();
+    Fraction hopoTextEndTick = endChord->tick();
+
+    bool shortenFromStart = (hopoTextStartTick - hopoStartTick) < (hopoEndTick - hopoTextEndTick);
+    EditData editData;
+    editData.curGrip = shortenFromStart ? Grip::START : Grip::END;
+
+    if (shortenFromStart) {
+        Fraction newStartTick = hopoTextEndTick;
+        Fraction newTicks = hopoEndTick - newStartTick;
+        hopo->undoChangeProperty(Pid::SPANNER_TICK, newStartTick);
+        hopo->undoChangeProperty(Pid::SPANNER_TICKS, newTicks);
+        hopo->undoChangeStartEndElements(endChord, hopoEndChord);
+        if (startChord != hopoStartChord) {
+            HammerOnPullOff* newHopo = Factory::createHammerOnPullOff(score()->dummy());
+            newHopo->setTrack(hopo->track());
+            newHopo->setTick(hopoStartTick);
+            newHopo->setTick2(hopoTextStartTick);
+            newHopo->setStartElement(hopoStartChord);
+            newHopo->setEndElement(startChord);
+            score()->undoAddElement(newHopo);
+        }
+    } else {
+        Fraction newEndTick = hopoTextStartTick;
+        Fraction newTicks = newEndTick - hopoStartTick;
+        hopo->undoChangeProperty(Pid::SPANNER_TICKS, newTicks);
+        hopo->undoChangeStartEndElements(hopoStartChord, startChord);
+        if (endChord != hopoEndChord) {
+            HammerOnPullOff* newHopo = new HammerOnPullOff(score()->dummy());
+            newHopo->setTrack(hopo->track());
+            newHopo->setTick(hopoTextEndTick);
+            newHopo->setTick2(hopoEndTick);
+            newHopo->setStartElement(endChord);
+            newHopo->setEndElement(hopoEndChord);
+            score()->undoAddElement(newHopo);
         }
     }
 }
