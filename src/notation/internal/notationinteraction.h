@@ -157,7 +157,7 @@ public:
     bool textEditingAllowed(const EngravingItem* element) const override;
     void startEditText(EngravingItem* element, const muse::PointF& cursorPos = muse::PointF()) override;
     void editText(QInputMethodEvent* event) override;
-    void endEditText() override;
+    void endEditText(bool startNonTextualEdit = true) override;
     void changeTextCursorPosition(const muse::PointF& newCursorPos) override;
     void selectText(mu::engraving::SelectTextType type) override;
     const TextBase* editedText() const override;
@@ -199,6 +199,7 @@ public:
     void addLaissezVibToSelection() override;
     void addTiedNoteToChord() override;
     void addSlurToSelection() override;
+    void addHammerOnPullOffToSelection() override;
     void addOttavaToSelection(OttavaType type) override;
     void addHairpinOnGripDrag(engraving::EditData& ed, bool isLeftGrip) override;
     void addHairpinsToSelection(HairpinType type) override;
