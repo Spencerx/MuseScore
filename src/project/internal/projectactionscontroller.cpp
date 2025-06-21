@@ -68,8 +68,12 @@ void ProjectActionsController::init()
 
     dispatcher()->reg(this, "file-close", [this]() {
         auto anyInstanceWithoutProject = multiInstancesProvider()->isHasAppInstanceWithoutProject();
-        closeOpenedProject(anyInstanceWithoutProject);
-        if (anyInstanceWithoutProject) {
+        bool ok = closeOpenedProject();
+        if (ok && anyInstanceWithoutProject) {
+            //! NOTE: we need to call `quit` in the next event loop due to controlling the lifecycle of this method
+            async::Async::call(this, [this]() {
+                dispatcher()->dispatch("quit", ActionData::make_arg1<bool>(false));
+            });
             multiInstancesProvider()->activateWindowWithoutProject();
         }
     });
@@ -79,6 +83,7 @@ void ProjectActionsController::init()
     dispatcher()->reg(this, "file-save-a-copy", [this]() { saveProject(SaveMode::SaveCopy); });
     dispatcher()->reg(this, "file-save-selection", [this]() { saveProject(SaveMode::SaveSelection, SaveLocationType::Local); });
     dispatcher()->reg(this, "file-save-to-cloud", [this]() { saveProject(SaveMode::SaveAs, SaveLocationType::Cloud); });
+    dispatcher()->reg(this, "file-save-at", [this](const ActionData& args) { saveProjectAt(args); });
 
     dispatcher()->reg(this, "file-publish", this, &ProjectActionsController::publish);
     dispatcher()->reg(this, "file-share-audio", this, &ProjectActionsController::shareAudio);
@@ -185,13 +190,18 @@ Ret ProjectActionsController::openProject(const ProjectFile& file)
     LOGI() << "Try open project: url = " << file.url.toString() << ", displayNameOverride = " << file.displayNameOverride;
 
     if (file.isNull()) {
-        muse::io::path_t askedPath = selectScoreOpeningFile();
+        auto promise = selectScoreOpeningFile();
+        promise.onResolve(this, [this](const io::path_t& askedPath) {
+            if (askedPath.empty()) {
+                return;
+            }
 
-        if (askedPath.empty()) {
-            return make_ret(Ret::Code::Cancel);
-        }
+            configuration()->setLastOpenedProjectsPath(io::dirpath(askedPath));
 
-        return openProject(askedPath);
+            openProject(askedPath);
+        });
+
+        return muse::make_ok();
     }
 
     if (file.url.isLocalFile()) {
@@ -603,11 +613,10 @@ muse::async::Notification ProjectActionsController::projectBeingDownloadedChange
 
 Ret ProjectActionsController::openPageIfNeed(Uri pageUri)
 {
-    if (interactive()->isOpened(pageUri).val) {
-        return make_ret(Ret::Code::Ok);
+    if (!interactive()->isOpened(pageUri).val) {
+        interactive()->open(pageUri);
     }
-
-    return interactive()->openSync(pageUri).ret;
+    return make_ret(Ret::Code::Ok);
 }
 
 bool ProjectActionsController::isProjectOpened(const muse::io::path_t& scorePath) const
@@ -674,7 +683,7 @@ void ProjectActionsController::newProject()
     });
 }
 
-bool ProjectActionsController::closeOpenedProject(bool quitApp)
+bool ProjectActionsController::closeOpenedProject(bool goToHome)
 {
     if (m_isProjectClosing) {
         return false;
@@ -712,12 +721,7 @@ bool ProjectActionsController::closeOpenedProject(bool quitApp)
         interactive()->closeAllDialogs();
         globalContext()->setCurrentProject(nullptr);
 
-        if (quitApp) {
-            //! NOTE: we need to call `quit` in the next event loop due to controlling the lifecycle of this method
-            async::Async::call(this, [this]() {
-                dispatcher()->dispatch("quit", ActionData::make_arg1<bool>(false));
-            });
-        } else {
+        if (goToHome) {
             Ret ret = openPageIfNeed(HOME_PAGE_URI);
             if (!ret) {
                 LOGE() << ret.toString();
@@ -901,6 +905,14 @@ void ProjectActionsController::shareAudio(const AudioFile& existingAudio)
     });
 
     isSharingFinished = false;
+}
+
+void ProjectActionsController::saveProjectAt(const muse::actions::ActionData& args)
+{
+    io::path_t path = !args.empty() ? args.arg<io::path_t>(0) : io::path_t();
+    if (!path.empty()) {
+        saveProjectAt(SaveLocation(path));
+    }
 }
 
 bool ProjectActionsController::saveProjectAt(const SaveLocation& location, SaveMode saveMode, bool force)
@@ -1865,7 +1877,7 @@ void ProjectActionsController::printScore()
     printProvider()->printNotation(notation);
 }
 
-muse::io::path_t ProjectActionsController::selectScoreOpeningFile()
+async::Promise<io::path_t> ProjectActionsController::selectScoreOpeningFile() const
 {
     std::string allExt = "*.mscz *.mxl *.musicxml *.xml *.mid *.midi *.kar *.md *.mgu *.sgu *.cap *.capx "
                          "*.ove *.scw *.bmw *.bww *.gtp *.gp3 *.gp4 *.gp5 *.gpx *.gp *.ptb *.mei *.mscx *.mscs *.mscz~";
@@ -1896,13 +1908,7 @@ muse::io::path_t ProjectActionsController::selectScoreOpeningFile()
         defaultDir = configuration()->defaultUserProjectsPath();
     }
 
-    muse::io::path_t filePath = interactive()->selectOpeningFile(muse::qtrc("project", "Open"), defaultDir, filter);
-
-    if (!filePath.empty()) {
-        configuration()->setLastOpenedProjectsPath(io::dirpath(filePath));
-    }
-
-    return filePath;
+    return interactive()->selectOpeningFile(muse::trc("project", "Open"), defaultDir, filter);
 }
 
 bool ProjectActionsController::hasSelection() const

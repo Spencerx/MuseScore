@@ -101,6 +101,7 @@ public:
     Segment* next1(SegmentType) const;
     Segment* next1ChordRestOrTimeTick() const;
     Segment* next1WithElemsOnStaff(staff_idx_t staffIdx, SegmentType segType = SegmentType::ChordRest) const;
+    Segment* next1WithElemsOnTrack(track_idx_t trackIdx, SegmentType segType = SegmentType::ChordRest) const;
     Segment* next1MM(SegmentType) const;
 
     Segment* prev1() const;
@@ -300,6 +301,8 @@ public:
     bool isInsideTupletOnStaff(staff_idx_t staffIdx) const;
 
 private:
+
+    void addArticulationsToShape(const Chord* chord, Shape& shape);
 
     friend class Factory;
     Segment(Measure* m = 0);
